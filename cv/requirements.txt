@@ -1,0 +1,14 @@
+# requirements.txt
+
+# Core CV dependencies
+torch==2.0.1
+torchvision==0.15.2
+opencv-python
+numpy
+Pillow
+pycocotools
+
+# Web server
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+
