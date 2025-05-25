@@ -1,50 +1,45 @@
-import numpy as np
-import onnxruntime as ort
-from transformers import Wav2Vec2Processor
+"""
+Manages ASR inference.
+"""
+
+import io
 import torch
+import soundfile as sf
 import jiwer
+from transformers import Wav2Vec2Processor, Wav2Vec2ForCTC
+import os
 
 class ASRManager:
-    def __init__(self, onnx_model_path: str = "./finetuned-wav2vec2/model.onnx", processor_path: str = "./finetuned-wav2vec2"):
-        # Load ONNX model session with CUDA if available, else CPU
-        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider'] if ort.get_device() == 'GPU' else ['CPUExecutionProvider']
-        self.session = ort.InferenceSession(onnx_model_path, providers=providers)
+    def __init__(self):
+        #model_name = "facebook/wav2vec2-large-960h-lv60-self"
+        model_dir = os.getenv("MODEL_DIR", "/app/finetuned-wav2vec2")
+        self.processor = Wav2Vec2Processor.from_pretrained(model_dir)
+        self.model     = Wav2Vec2ForCTC.from_pretrained(model_dir)
+        #self.processor = Wav2Vec2Processor.from_pretrained(model_name)
+        #self.model = Wav2Vec2ForCTC.from_pretrained(model_name)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(device)
+        self.model.eval()
+        self.device = device
+        self.target_sampling_rate = self.processor.feature_extractor.sampling_rate
 
-        # Load processor (tokenizer + feature extractor)
-        self.processor = Wav2Vec2Processor.from_pretrained(processor_path)
-
-        # Prepare text normalization pipeline for better output
-        self.text_normalizer = jiwer.Compose([
+    def asr(self, audio_bytes: bytes) -> str:
+        audio_input, sample_rate = sf.read(io.BytesIO(audio_bytes))
+        if audio_input.ndim > 1:
+            audio_input = audio_input.mean(axis=1)
+        if sample_rate != self.target_sampling_rate:
+            raise ValueError(f"Expected sample rate {self.target_sampling_rate}, got {sample_rate}")
+        inputs = self.processor(audio_input, sampling_rate=sample_rate, return_tensors="pt", padding=True)
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        with torch.no_grad():
+            logits = self.model(**inputs).logits
+        predicted_ids = torch.argmax(logits, dim=-1)
+        transcription = self.processor.batch_decode(predicted_ids)[0]
+        transforms = jiwer.Compose([
             jiwer.ToLowerCase(),
-            jiwer.RemoveMultipleSpaces(),
-            jiwer.Strip(),
-            jiwer.RemovePunctuation()
+            jiwer.SubstituteRegexes({"-": " "}),
+            jiwer.RemovePunctuation(),
+            jiwer.ReduceToListOfListOfWords(),
         ])
-
-    def preprocess(self, audio_array, sampling_rate=16000):
-        # Process raw audio to input tensor expected by model
-        inputs = self.processor(audio_array, sampling_rate=sampling_rate, return_tensors="np", padding=True)
-        return inputs
-
-    def infer(self, input_values):
-        # Run ONNX inference
-        ort_inputs = {self.session.get_inputs()[0].name: input_values}
-        ort_outs = self.session.run(None, ort_inputs)
-        logits = ort_outs[0]
-        return logits
-
-    def decode(self, logits):
-        # Convert logits to predicted token IDs
-        predicted_ids = np.argmax(logits, axis=-1)
-        # Decode token IDs to string
-        transcription = self.processor.batch_decode(predicted_ids)
-        # Normalize the text output
-        normalized = self.text_normalizer(transcription[0])
-        return normalized
-
-    def transcribe(self, audio_array, sampling_rate=16000):
-        # Complete inference pipeline: preprocess, infer, decode
-        inputs = self.preprocess(audio_array, sampling_rate)
-        logits = self.infer(inputs['input_values'])
-        transcription = self.decode(logits)
-        return transcription
+        words = transforms(transcription)[0]
+        return " ".join(words)
